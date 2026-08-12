@@ -53,6 +53,26 @@ def is_regular_market_hours():
 STOP_LOSS_PERCENT = 0.015  # 1.5%
  
  
+def cancel_open_orders_for_symbol(symbol):
+    """Cancels any resting orders (e.g. a pending stop-loss leg) that are holding
+    shares of this symbol, so a manual sell we submit right after isn't rejected
+    for 'insufficient qty available'."""
+    try:
+        resp = requests.get(
+            f"{ALPACA_BASE_URL}/v2/orders",
+            params={"status": "open", "symbols": symbol},
+            headers=HEADERS,
+        )
+        if resp.status_code != 200:
+            print(f"cancel_open_orders_for_symbol: failed to list orders for {symbol}", resp.text)
+            return
+        for o in resp.json():
+            cancel_resp = requests.delete(f"{ALPACA_BASE_URL}/v2/orders/{o['id']}", headers=HEADERS)
+            print(f"Cancelled open order {o['id']} for {symbol}: {cancel_resp.status_code}")
+    except Exception as e:
+        print(f"cancel_open_orders_for_symbol error for {symbol}:", e)
+ 
+ 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(force=True)
@@ -159,6 +179,7 @@ def check_positions_and_protect():
  
             if drop_percent >= STOP_LOSS_PERCENT:
                 print(f"Monitor: {symbol} down {drop_percent:.2%} from entry — selling {qty} shares")
+                cancel_open_orders_for_symbol(symbol)
                 sell_order = {
                     "symbol": symbol,
                     "qty": qty,
@@ -222,6 +243,7 @@ def force_close_all_positions():
                 continue
  
             print(f"Force-close: closing {symbol} ({qty} shares) — 17:55 NY reached")
+            cancel_open_orders_for_symbol(symbol)
             sell_order = {
                 "symbol": symbol,
                 "qty": qty,
