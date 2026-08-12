@@ -1,5 +1,6 @@
-
 import os
+import time
+import threading
 import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -30,6 +31,9 @@ def is_regular_market_hours():
     return market_open <= minutes_since_midnight < market_close
  
  
+STOP_LOSS_PERCENT = 0.015  # 1.5%
+ 
+ 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(force=True)
@@ -47,6 +51,9 @@ def webhook():
     if not all([ticker, action, quantity, limit_price]):
         return jsonify({"error": "missing fields", "data": data}), 400
  
+    regular_hours = is_regular_market_hours()
+    limit_price_float = float(limit_price)
+ 
     order = {
         "symbol": ticker,
         "qty": str(quantity),
@@ -57,8 +64,19 @@ def webhook():
         # only flag as extended_hours when we're actually outside the regular
         # 9:30-16:00 ET session — during regular hours this routes orders through
         # a slower venue, which caused real delays we saw in testing
-        "extended_hours": not is_regular_market_hours(),
+        "extended_hours": not regular_hours,
     }
+ 
+    stop_loss_attached = False
+ 
+    # Attach a stop loss automatically for buy orders — but only during regular
+    # market hours, since Alpaca bracket orders (entry + stop loss together)
+    # are not supported for extended_hours orders.
+    if action == "buy" and regular_hours:
+        stop_price = round(limit_price_float * (1 - STOP_LOSS_PERCENT), 2)
+        order["order_class"] = "bracket"
+        order["stop_loss"] = {"stop_price": str(stop_price)}
+        stop_loss_attached = True
  
     response = requests.post(
         f"{ALPACA_BASE_URL}/v2/orders",
@@ -70,6 +88,7 @@ def webhook():
  
     return jsonify({
         "sent_order": order,
+        "stop_loss_attached": stop_loss_attached,
         "alpaca_status": response.status_code,
         "alpaca_response": response.json() if response.text else {},
     }), response.status_code
@@ -78,6 +97,71 @@ def webhook():
 @app.route("/", methods=["GET"])
 def home():
     return "Webhook server is running."
+ 
+ 
+# --- SOFTWARE STOP LOSS MONITOR (for extended-hours positions) ---
+# Regular-hours buys already get a real broker-side stop loss attached (bracket
+# order above). Positions opened outside regular hours can't have a bracket
+# stop attached, so this background loop watches them itself: if the price
+# drops more than STOP_LOSS_PERCENT below the average entry price, it submits
+# a sell order for that position.
+ 
+selling_in_progress = set()  # symbols we've already triggered a protective sell for
+ 
+ 
+def check_positions_and_protect():
+    try:
+        positions_resp = requests.get(f"{ALPACA_BASE_URL}/v2/positions", headers=HEADERS)
+        if positions_resp.status_code != 200:
+            print("Monitor: failed to fetch positions", positions_resp.text)
+            return
+ 
+        current_symbols = set()
+        for position in positions_resp.json():
+            symbol = position["symbol"]
+            current_symbols.add(symbol)
+            side = position["side"]
+            qty = position["qty"]
+            avg_entry_price = float(position["avg_entry_price"])
+            current_price = float(position["current_price"])
+ 
+            if side != "long":
+                continue
+            if symbol in selling_in_progress:
+                continue
+ 
+            drop_percent = (avg_entry_price - current_price) / avg_entry_price
+ 
+            if drop_percent >= STOP_LOSS_PERCENT:
+                print(f"Monitor: {symbol} down {drop_percent:.2%} from entry — selling {qty} shares")
+                sell_order = {
+                    "symbol": symbol,
+                    "qty": qty,
+                    "side": "sell",
+                    "type": "limit",
+                    "limit_price": str(current_price),
+                    "time_in_force": "day",
+                    "extended_hours": not is_regular_market_hours(),
+                }
+                resp = requests.post(f"{ALPACA_BASE_URL}/v2/orders", json=sell_order, headers=HEADERS)
+                print("Monitor: protective sell response", resp.status_code, resp.text)
+                if resp.status_code in (200, 201):
+                    selling_in_progress.add(symbol)
+ 
+        # a symbol no longer in open positions means it fully closed out —
+        # clear it so a future re-entry gets monitored again
+        selling_in_progress.intersection_update(current_symbols)
+    except Exception as e:
+        print("Monitor error:", e)
+ 
+ 
+def monitor_loop():
+    while True:
+        check_positions_and_protect()
+        time.sleep(30)  # check every 30 seconds
+ 
+ 
+threading.Thread(target=monitor_loop, daemon=True).start()
  
  
 if __name__ == "__main__":
