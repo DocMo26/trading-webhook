@@ -191,9 +191,65 @@ def check_positions_and_protect():
         send_alert(f"🚨 MONITOR ERROR\nThe stop-loss monitor hit an error and may not be protecting positions:\n{e}")
  
  
+def is_force_close_time():
+    """Returns True during the 17:55-17:56 ET minute window (force-close all open trades)."""
+    now_ny = datetime.now(ZoneInfo("America/New_York"))
+    return now_ny.hour == 17 and now_ny.minute == 55
+ 
+ 
+force_closed_today = set()  # symbols already force-closed today, to avoid repeat orders in the same minute
+ 
+ 
+def force_close_all_positions():
+    try:
+        positions_resp = requests.get(f"{ALPACA_BASE_URL}/v2/positions", headers=HEADERS)
+        if positions_resp.status_code != 200:
+            print("Force-close: failed to fetch positions", positions_resp.text)
+            return
+ 
+        for position in positions_resp.json():
+            symbol = position["symbol"]
+            side = position["side"]
+            qty = position["qty"]
+            current_price = float(position["current_price"])
+ 
+            if side != "long":
+                continue
+            if symbol in force_closed_today:
+                continue
+ 
+            print(f"Force-close: closing {symbol} ({qty} shares) — 17:55 NY reached")
+            sell_order = {
+                "symbol": symbol,
+                "qty": qty,
+                "side": "sell",
+                "type": "limit",
+                "limit_price": str(current_price),
+                "time_in_force": "day",
+                "extended_hours": not is_regular_market_hours(),
+            }
+            resp = requests.post(f"{ALPACA_BASE_URL}/v2/orders", json=sell_order, headers=HEADERS)
+            print("Force-close: sell response", resp.status_code, resp.text)
+            if resp.status_code in (200, 201):
+                force_closed_today.add(symbol)
+                send_alert(f"🔔 FORCE CLOSE (17:55 NY)\nSymbol: {symbol}\nSell order submitted for {qty} shares.")
+            else:
+                send_alert(
+                    f"🚨 FORCE CLOSE FAILED\nSymbol: {symbol}\nCouldn't close position at 17:55 NY.\n"
+                    f"Status: {resp.status_code}\nResponse: {resp.text}\nPlease check this position manually."
+                )
+    except Exception as e:
+        print("Force-close error:", e)
+        send_alert(f"🚨 FORCE CLOSE ERROR\n{e}")
+ 
+ 
 def monitor_loop():
     while True:
         check_positions_and_protect()
+        if is_force_close_time():
+            force_close_all_positions()
+        else:
+            force_closed_today.clear()  # reset once we're past the 17:55 minute, ready for tomorrow
         time.sleep(30)  # check every 30 seconds
  
  
