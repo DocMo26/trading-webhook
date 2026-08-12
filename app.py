@@ -1,3 +1,4 @@
+
 import os
 import time
 import threading
@@ -18,6 +19,24 @@ HEADERS = {
     "APCA-API-KEY-ID": ALPACA_API_KEY,
     "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
 }
+ 
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+ 
+ 
+def send_alert(message):
+    """Sends a Telegram message. Never raises — a failed alert shouldn't crash the server."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram not configured, skipping alert:", message)
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+            timeout=10,
+        )
+    except Exception as e:
+        print("Failed to send Telegram alert:", e)
  
  
 def is_regular_market_hours():
@@ -86,6 +105,12 @@ def webhook():
  
     print("Alpaca response:", response.status_code, response.text)
  
+    if response.status_code not in (200, 201):
+        send_alert(
+            f"⚠️ ORDER FAILED\nSymbol: {ticker}\nAction: {action}\nQty: {quantity}\n"
+            f"Price: {limit_price}\nAlpaca status: {response.status_code}\nResponse: {response.text}"
+        )
+ 
     return jsonify({
         "sent_order": order,
         "stop_loss_attached": stop_loss_attached,
@@ -147,12 +172,23 @@ def check_positions_and_protect():
                 print("Monitor: protective sell response", resp.status_code, resp.text)
                 if resp.status_code in (200, 201):
                     selling_in_progress.add(symbol)
+                    send_alert(
+                        f"🛑 STOP LOSS TRIGGERED\nSymbol: {symbol}\nDropped {drop_percent:.2%} from entry "
+                        f"(entry: {avg_entry_price}, current: {current_price})\nSell order submitted for {qty} shares."
+                    )
+                else:
+                    send_alert(
+                        f"🚨 STOP LOSS SELL FAILED\nSymbol: {symbol}\nDropped {drop_percent:.2%} from entry, "
+                        f"but the protective sell order was REJECTED.\nStatus: {resp.status_code}\nResponse: {resp.text}\n"
+                        f"Please check this position manually."
+                    )
  
         # a symbol no longer in open positions means it fully closed out —
         # clear it so a future re-entry gets monitored again
         selling_in_progress.intersection_update(current_symbols)
     except Exception as e:
         print("Monitor error:", e)
+        send_alert(f"🚨 MONITOR ERROR\nThe stop-loss monitor hit an error and may not be protecting positions:\n{e}")
  
  
 def monitor_loop():
