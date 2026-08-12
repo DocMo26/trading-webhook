@@ -164,7 +164,7 @@ def check_positions_and_protect():
                     "qty": qty,
                     "side": "sell",
                     "type": "limit",
-                    "limit_price": str(current_price),
+                    "limit_price": str(round(current_price, 2)),
                     "time_in_force": "day",
                     "extended_hours": not is_regular_market_hours(),
                 }
@@ -192,12 +192,15 @@ def check_positions_and_protect():
  
  
 def is_force_close_time():
-    """Returns True during the 17:55-17:56 ET minute window (force-close all open trades)."""
+    """Returns True from 17:55 ET onward for the rest of the day — keeps retrying
+    if an earlier close attempt failed, instead of giving up after one minute."""
     now_ny = datetime.now(ZoneInfo("America/New_York"))
-    return now_ny.hour == 17 and now_ny.minute == 55
+    minutes_since_midnight = now_ny.hour * 60 + now_ny.minute
+    return minutes_since_midnight >= (17 * 60 + 55)
  
  
-force_closed_today = set()  # symbols already force-closed today, to avoid repeat orders in the same minute
+force_closed_today = set()  # symbols already force-closed today, to avoid repeat orders
+last_force_close_date = None
  
  
 def force_close_all_positions():
@@ -224,7 +227,7 @@ def force_close_all_positions():
                 "qty": qty,
                 "side": "sell",
                 "type": "limit",
-                "limit_price": str(current_price),
+                "limit_price": str(round(current_price, 2)),
                 "time_in_force": "day",
                 "extended_hours": not is_regular_market_hours(),
             }
@@ -244,12 +247,15 @@ def force_close_all_positions():
  
  
 def monitor_loop():
+    global last_force_close_date
     while True:
         check_positions_and_protect()
+        now_ny = datetime.now(ZoneInfo("America/New_York"))
         if is_force_close_time():
             force_close_all_positions()
-        else:
-            force_closed_today.clear()  # reset once we're past the 17:55 minute, ready for tomorrow
+        elif last_force_close_date != now_ny.date():
+            force_closed_today.clear()  # new day — ready to force-close again this evening
+            last_force_close_date = now_ny.date()
         time.sleep(30)  # check every 30 seconds
  
  
