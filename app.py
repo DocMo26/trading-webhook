@@ -93,7 +93,7 @@ def webhook():
     # are not supported for extended_hours orders.
     if action == "buy" and regular_hours:
         stop_price = round(limit_price_float * (1 - STOP_LOSS_PERCENT), 2)
-        order["order_class"] = "bracket"
+        order["order_class"] = "oto"  # one-triggers-other: allows stop_loss alone, unlike "bracket" which requires take_profit too
         order["stop_loss"] = {"stop_price": str(stop_price)}
         stop_loss_attached = True
  
