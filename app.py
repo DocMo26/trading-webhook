@@ -1,4 +1,3 @@
-
 import os
 import time
 import threading
@@ -73,70 +72,105 @@ def cancel_open_orders_for_symbol(symbol):
         print(f"cancel_open_orders_for_symbol error for {symbol}:", e)
  
  
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json(force=True)
-    print("Received signal:", data)
+def get_real_position_qty(symbol):
+    """Returns the actual open share quantity for this symbol on Alpaca (0 if none)."""
+    try:
+        resp = requests.get(f"{ALPACA_BASE_URL}/v2/positions/{symbol}", headers=HEADERS, timeout=15)
+        if resp.status_code == 200:
+            return float(resp.json().get("qty", 0))
+        return 0  # 404 means no position — that's expected, not an error
+    except Exception as e:
+        print(f"get_real_position_qty error for {symbol}:", e)
+        return None  # None = "couldn't check", different from 0 = "confirmed no position"
  
-    # simple password check
-    if WEBHOOK_PASSWORD and data.get("password") != WEBHOOK_PASSWORD:
-        return jsonify({"error": "unauthorized"}), 401
  
+def process_order(data):
+    """Does the actual Alpaca order submission. Runs in a background thread so the
+    /webhook route can respond to TradingView instantly, since TradingView times out
+    webhook deliveries after just a few seconds."""
     ticker = data.get("ticker")
-    action = data.get("action")  # "buy" or "sell"
+    action = data.get("action")
     quantity = data.get("quantity")
-    limit_price = data.get("price")  # comes from Pine script, e.g. {{strategy.order.price}} or close
- 
-    if not all([ticker, action, quantity, limit_price]):
-        return jsonify({"error": "missing fields", "data": data}), 400
+    limit_price = data.get("price")
  
     regular_hours = is_regular_market_hours()
     limit_price_float = float(limit_price)
+ 
+    # TradingView's own simulated strategy position can drift from the real
+    # Alpaca account (e.g. after a failed order, a manual close, or unrealistic
+    # position sizing). Check the real position before acting, instead of
+    # blindly trusting the signal.
+    real_qty = get_real_position_qty(ticker)
+ 
+    if action == "sell":
+        if real_qty == 0:
+            print(f"Ignoring phantom sell signal for {ticker} — no real position held")
+            send_alert(f"ℹ️ Ignored sell signal for {ticker} — no real position exists on Alpaca (phantom signal).")
+            return
+        if real_qty is not None:
+            quantity = real_qty  # sell exactly what we actually hold, not what the signal assumed
+        cancel_open_orders_for_symbol(ticker)  # release any resting stop-loss leg first
+ 
+    if action == "buy" and real_qty and real_qty > 0:
+        print(f"Ignoring buy signal for {ticker} — already holding {real_qty} shares")
+        send_alert(f"ℹ️ Ignored buy signal for {ticker} — already holding {real_qty} shares (avoiding duplicate entry).")
+        return
  
     order = {
         "symbol": ticker,
         "qty": str(quantity),
         "side": action,
         "type": "limit",
-        "limit_price": str(limit_price),
+        "limit_price": str(round(limit_price_float, 2)),
         "time_in_force": "day",
-        # only flag as extended_hours when we're actually outside the regular
-        # 9:30-16:00 ET session — during regular hours this routes orders through
-        # a slower venue, which caused real delays we saw in testing
         "extended_hours": not regular_hours,
     }
  
     stop_loss_attached = False
  
-    # Attach a stop loss automatically for buy orders — but only during regular
-    # market hours, since Alpaca bracket orders (entry + stop loss together)
-    # are not supported for extended_hours orders.
     if action == "buy" and regular_hours:
         stop_price = round(limit_price_float * (1 - STOP_LOSS_PERCENT), 2)
         order["order_class"] = "oto"  # one-triggers-other: allows stop_loss alone, unlike "bracket" which requires take_profit too
         order["stop_loss"] = {"stop_price": str(stop_price)}
         stop_loss_attached = True
  
-    response = requests.post(
-        f"{ALPACA_BASE_URL}/v2/orders",
-        json=order,
-        headers=HEADERS,
-    )
+    try:
+        response = requests.post(f"{ALPACA_BASE_URL}/v2/orders", json=order, headers=HEADERS, timeout=20)
+        print("Alpaca response:", response.status_code, response.text)
  
-    print("Alpaca response:", response.status_code, response.text)
+        if response.status_code not in (200, 201):
+            send_alert(
+                f"⚠️ ORDER FAILED\nSymbol: {ticker}\nAction: {action}\nQty: {quantity}\n"
+                f"Price: {limit_price}\nAlpaca status: {response.status_code}\nResponse: {response.text}"
+            )
+        elif stop_loss_attached:
+            send_alert(f"✅ BUY FILLED with stop loss\nSymbol: {ticker}\nQty: {quantity}\nLimit price: {limit_price}")
+    except Exception as e:
+        print("process_order error:", e)
+        send_alert(f"🚨 ORDER SUBMISSION ERROR\nSymbol: {ticker}\nAction: {action}\n{e}")
  
-    if response.status_code not in (200, 201):
-        send_alert(
-            f"⚠️ ORDER FAILED\nSymbol: {ticker}\nAction: {action}\nQty: {quantity}\n"
-            f"Price: {limit_price}\nAlpaca status: {response.status_code}\nResponse: {response.text}"
-        )
  
-    return jsonify({
-        "sent_order": order,
-        "stop_loss_attached": stop_loss_attached,
-        "alpaca_status": response.status_code,
-        "alpaca_response": response.json() if response.text else {},
-    }), response.status_code
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json(force=True)
+    print("Received signal:", data)
+ 
+    if WEBHOOK_PASSWORD and data.get("password") != WEBHOOK_PASSWORD:
+        return jsonify({"error": "unauthorized"}), 401
+ 
+    ticker = data.get("ticker")
+    action = data.get("action")
+    quantity = data.get("quantity")
+    limit_price = data.get("price")
+ 
+    if not all([ticker, action, quantity, limit_price]):
+        return jsonify({"error": "missing fields", "data": data}), 400
+ 
+    # hand off the actual order submission to a background thread and respond
+    # immediately — TradingView only waits a few seconds for a webhook reply
+    threading.Thread(target=process_order, args=(data,), daemon=True).start()
+ 
+    return jsonify({"received": True, "ticker": ticker, "action": action}), 200
  
  
 @app.route("/", methods=["GET"])
@@ -145,12 +179,6 @@ def home():
  
  
 # --- SOFTWARE STOP LOSS MONITOR (for extended-hours positions) ---
-# Regular-hours buys already get a real broker-side stop loss attached (bracket
-# order above). Positions opened outside regular hours can't have a bracket
-# stop attached, so this background loop watches them itself: if the price
-# drops more than STOP_LOSS_PERCENT below the average entry price, it submits
-# a sell order for that position.
- 
 selling_in_progress = set()  # symbols we've already triggered a protective sell for
  
  
@@ -204,8 +232,6 @@ def check_positions_and_protect():
                         f"Please check this position manually."
                     )
  
-        # a symbol no longer in open positions means it fully closed out —
-        # clear it so a future re-entry gets monitored again
         selling_in_progress.intersection_update(current_symbols)
     except Exception as e:
         print("Monitor error:", e)
@@ -220,7 +246,7 @@ def is_force_close_time():
     return minutes_since_midnight >= (17 * 60 + 55)
  
  
-force_closed_today = set()  # symbols already force-closed today, to avoid repeat orders
+force_closed_today = set()
 last_force_close_date = None
  
  
